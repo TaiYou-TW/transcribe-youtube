@@ -1,0 +1,7 @@
+yt-dlp>=2026.8.19
+faster-whisper>=1.2.1       # faster 後端; cpp 後端也用它的 silero VAD 與音訊解碼
+huggingface-hub>=1.0        # 下載 ggml 模型
+numpy>=2.0
+fastapi>=0.141
+uvicorn[standard]>=0.53
+mlx-whisper>=0.4.3; sys_platform == "darwin" and platform_machine == "arm64"  # 選用: mlx 後端

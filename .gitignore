@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# runtime output
+downloads/
+transcripts/
+logs/
+bench/
+
+# models
+*.bin
+
+.DS_Store

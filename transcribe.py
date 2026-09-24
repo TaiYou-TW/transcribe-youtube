@@ -360,6 +360,7 @@ class WhisperCppBackend:
     """
 
     SR = 16000
+    BATCH = 40  # 每次交給 whisper-cli 的片段數 (15 秒片段約 10 分鐘語音)
 
     def __init__(self, model_id: str, beam_size: int, chunk_length: int):
         self.cli = shutil.which("whisper-cli")
@@ -421,49 +422,59 @@ class WhisperCppBackend:
         if not chunks:
             return [], {"language": language, "duration": duration}
 
+        cmd = [
+            self.cli, "-m", self.model_path,
+            "-l", "auto" if language == "auto" else language,
+            "-bs", str(self.beam_size), "-bo", str(self.beam_size),
+            "-mc", "0",  # 不帶前文 (同 condition_on_previous_text=False)
+            "-nt", "-otxt",
+        ]
+        if language != "auto":
+            cmd.append("-np")  # auto 時要留著 log 才讀得到偵測出的語言
+        if self.audio_ctx:
+            cmd += ["-ac", str(self.audio_ctx)]  # encoder 只算 chunk_length 秒
+
+        out = []
+        logs = []
+        # 分批寫片段 WAV、轉完就刪: 1 小時直播全部片段約 73MB, 分批後暫存只剩一批 (~19MB);
+        # 代價是每批多載一次模型 (~0.3 秒)
         with tempfile.TemporaryDirectory(prefix="kw_cpp_") as tmp:
-            wavs = []
-            for i, (_, _, data) in enumerate(chunks):
-                path = Path(tmp) / f"{i:05d}.wav"
-                with wave.open(str(path), "wb") as w:
-                    w.setnchannels(1)
-                    w.setsampwidth(2)
-                    w.setframerate(self.SR)
-                    w.writeframes((np.clip(data, -1, 1) * 32767).astype("<i2").tobytes())
-                wavs.append(path)
+            for b in range(0, len(chunks), self.BATCH):
+                batch = chunks[b:b + self.BATCH]
+                wavs = []
+                for i, (_, _, data) in enumerate(batch, b):
+                    path = Path(tmp) / f"{i:05d}.wav"
+                    with wave.open(str(path), "wb") as w:
+                        w.setnchannels(1)
+                        w.setsampwidth(2)
+                        w.setframerate(self.SR)
+                        w.writeframes((np.clip(data, -1, 1) * 32767).astype("<i2").tobytes())
+                    wavs.append(path)
 
-            cmd = [
-                self.cli, "-m", self.model_path,
-                "-l", "auto" if language == "auto" else language,
-                "-bs", str(self.beam_size), "-bo", str(self.beam_size),
-                "-mc", "0",  # 不帶前文 (同 condition_on_previous_text=False)
-                "-nt", "-otxt",
-            ]
-            if language != "auto":
-                cmd.append("-np")  # auto 時要留著 log 才讀得到偵測出的語言
-            if self.audio_ctx:
-                cmd += ["-ac", str(self.audio_ctx)]  # encoder 只算 chunk_length 秒
-            for w in wavs:
-                cmd += ["-f", str(w)]
-            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-            if proc.returncode != 0:
-                raise RuntimeError(f"whisper-cli 失敗: {proc.stderr.strip()[-500:]}")
+                proc = subprocess.run(
+                    cmd + [a for w in wavs for a in ("-f", str(w))],
+                    capture_output=True, text=True, errors="replace",
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"whisper-cli 失敗: {proc.stderr.strip()[-500:]}")
+                logs.append(proc.stderr + proc.stdout)
 
-            out = []
-            for (start, end, _), w in zip(chunks, wavs):
-                txt = Path(f"{w}.txt")
-                text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
-                text = " ".join(text.split())
-                if not text:
-                    continue
-                out.append({"start": start, "end": end, "text": text})
-                if verbose:
-                    print(f"  {min(end / duration * 100, 100):5.1f}% [{fmt_ts(start, '.')}] {text}")
+                for (start, end, _), w in zip(batch, wavs):
+                    txt = Path(f"{w}.txt")
+                    text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
+                    w.unlink(missing_ok=True)
+                    txt.unlink(missing_ok=True)
+                    text = " ".join(text.split())
+                    if not text:
+                        continue
+                    out.append({"start": start, "end": end, "text": text})
+                    if verbose:
+                        print(f"  {min(end / duration * 100, 100):5.1f}% [{fmt_ts(start, '.')}] {text}")
 
         if language == "auto":
             from collections import Counter
 
-            found = re.findall(r"auto-detected language: (\w+)", proc.stderr + proc.stdout)
+            found = re.findall(r"auto-detected language: (\w+)", "".join(logs))
             language = Counter(found).most_common(1)[0][0] if found else "auto"
         return out, {"language": language, "duration": duration}
 

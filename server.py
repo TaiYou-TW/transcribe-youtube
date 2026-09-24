@@ -103,16 +103,6 @@ def fetch_subs(url: str, lang: str, workdir: Path) -> tuple[str | None, dict]:
     return None, info
 
 
-def to_wav16k(src: Path, dst: Path) -> Path:
-    """16kHz 單聲道 16-bit PCM WAV (無損, 地端用)。"""
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)],
-        check=True,
-    )
-    return dst
-
-
 def run_job(url: str, lang: str) -> dict:
     with tempfile.TemporaryDirectory(prefix="kw_srv_") as tmp:
         workdir = Path(tmp)
@@ -121,12 +111,12 @@ def run_job(url: str, lang: str) -> dict:
         if subs:
             return {**base, "transcript": subs, "source": "subs"}
 
+        # 後端直接解碼下載的音檔 (m4a/webm...), 不另存 16kHz WAV: 1 小時省約 110MB 暫存
         got = tx.download_audio(url, workdir / "audio", playlist=False, quiet=True)
         if not got:
             raise RuntimeError("音檔下載失敗")
-        wav = to_wav16k(got[0].path, workdir / "audio.wav")
         backend, model_id = get_backend(lang)
-        segs, meta = backend.transcribe(wav, lang, verbose=False)
+        segs, meta = backend.transcribe(got[0].path, lang, verbose=False)
         text = "\n".join(s["text"] for s in segs if s["text"])
         return {
             **base,

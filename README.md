@@ -1,21 +1,26 @@
 # transcribe-youtube
 
-把 YouTube 日文影片（VTuber 直播為主）轉成逐字稿。包含兩部分：
+把 YouTube 影片轉成逐字稿，以日文 VTuber 直播為主，也支援英文等其他語言。包含兩部分：
 
 - **`transcribe.py`**：命令列工具，下載音檔 → 轉錄 → 輸出 txt / srt / vtt / json。
 - **`server.py`**：常駐的轉錄服務（FastAPI），用「提交 job + 輪詢」的 HTTP API，給 Discord bot 等外部程式呼叫。
 
-轉錄模型是 [litagin/anime-whisper](https://huggingface.co/litagin/anime-whisper)（以 kotoba-whisper-v2.0 微調於動漫 / Galgame 語音），對 VTuber 的情緒與非語言音辨識最好。
+## 模型與後端
 
-## 後端
+依語言自動選模型：
 
-| 後端 | 何時用 | 模型 |
-| --- | --- | --- |
-| `cpp`（whisper.cpp，Metal GPU） | Apple Silicon 上有 `whisper-cli` 時的預設 | `Aratako/anime-whisper-ggml` q8_0 |
-| `faster`（faster-whisper / CTranslate2） | 其他平台的預設（CUDA 或 CPU） | `quantumcookie/anime-whisper-ct2-int8` |
-| `mlx`（mlx-whisper） | 需明確指定；沒有 VAD，長片容易跳針 | `kaiinui/kotoba-whisper-v2.0-mlx` |
+- **日文（`ja`）**：[litagin/anime-whisper](https://huggingface.co/litagin/anime-whisper)，以 kotoba-whisper-v2.0 微調於動漫 / Galgame 語音，對 VTuber 的情緒與非語言音辨識最好，但**只懂日文**。
+- **其他語言與 `auto`（自動偵測）**：OpenAI 的 whisper-large-v3-turbo（多語）。
 
-`cpp` 後端先用 silero VAD 把語音切成 ≤15 秒的片段，再把每段分別交給 whisper.cpp 解碼。whisper.cpp 內建的 VAD 會把語音段接起來、以 30 秒窗口前進，而 anime-whisper 不輸出時間戳，每個窗口只會吐出前一兩句，實測漏掉約一半內容，還會跳針。
+| 後端 | 何時用 | `ja` 模型 | 其他語言模型 |
+| --- | --- | --- | --- |
+| `cpp`（whisper.cpp，Metal GPU） | Apple Silicon 上有 `whisper-cli` 時的預設 | `Aratako/anime-whisper-ggml` q8_0 | `ggerganov/whisper.cpp` large-v3-turbo q8_0 |
+| `faster`（faster-whisper / CTranslate2） | 其他平台的預設（CUDA 或 CPU） | `quantumcookie/anime-whisper-ct2-int8` | `deepdml/faster-whisper-large-v3-turbo-ct2` |
+| `mlx`（mlx-whisper） | 需明確指定；沒有 VAD，長片容易跳針 | `kaiinui/kotoba-whisper-v2.0-mlx` | `mlx-community/whisper-large-v3-turbo` |
+
+anime-whisper 是短句訓練的模型，會用 15 秒窗口並開啟防重複（`no_repeat_ngram_size=5`）；turbo 用標準的 30 秒窗口，不限制重複。
+
+`cpp` 後端先用 silero VAD 把語音切成 ≤15 秒（turbo 為 ≤30 秒）的片段，再把每段分別交給 whisper.cpp 解碼。whisper.cpp 內建的 VAD 會把語音段接起來、以 30 秒窗口前進，而 anime-whisper 不輸出時間戳，每個窗口只會吐出前一兩句，實測漏掉約一半內容，還會跳針。
 
 M3（16GB）上轉錄一支 1 小時直播（約 39 分鐘語音）的實測：
 
@@ -42,6 +47,8 @@ uv pip install -p .venv -r requirements.txt
 .venv/bin/python transcribe.py "https://www.youtube.com/watch?v=XXXX"
 .venv/bin/python transcribe.py video.mp4 --format txt,srt
 .venv/bin/python transcribe.py "https://..." --start 1:30 --duration 10:00
+.venv/bin/python transcribe.py "https://..." --language en      # 英文 (改用 large-v3-turbo)
+.venv/bin/python transcribe.py "https://..." --language auto    # 自動偵測語言
 .venv/bin/python transcribe.py "https://..." --backend faster --model anime
 .venv/bin/python transcribe.py --list-models
 ```
@@ -77,7 +84,8 @@ tail -f logs/server.log
 | --- | --- | --- |
 | `TRANSCRIBE_TOKEN` | （必填） | Bearer token |
 | `WHISPER_BACKEND` | `auto` | `auto` / `cpp` / `mlx` / `faster` |
-| `WHISPER_MODEL` | 依後端 | 別名、HF repo id；`cpp` 可給 `<owner>/<repo>/<檔名>` 或本機 `.bin` 路徑 |
+| `WHISPER_MODEL` | 依後端 | `ja` 用的模型：別名、HF repo id；`cpp` 可給 `<owner>/<repo>/<檔名>` 或本機 `.bin` 路徑 |
+| `WHISPER_MODEL_OTHER` | 依後端 | 其他語言與 `auto` 用的模型，格式同上 |
 | `QUEUE_MAX` | `5` | 排隊上限（不含執行中），超過回 429 |
 | `JOB_TTL` | `3600` | 完成的 job 保留秒數，過期後查詢回 404 |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | 監聽位址 |
@@ -88,14 +96,14 @@ tail -f logs/server.log
 
 | Method / Path | 說明 | 回應 |
 | --- | --- | --- |
-| `POST /jobs` `{"url": "...", "lang": "ja"}` | 提交轉錄 job | `202 {"job_id", "status": "queued", "position"}` |
+| `POST /jobs` `{"url": "...", "lang": "ja"}` | 提交轉錄 job；`lang` 是 ISO 639-1 代碼（`ja`、`en`、`zh`…）或 `auto`，格式不對回 422 | `202 {"job_id", "status": "queued", "position"}` |
 | `GET /jobs/{id}` | 查詢 job | `{"status": "queued\|running\|done\|error", "position", "result", "error"}` |
-| `GET /health` | 存活探測 | `{"status": "ok", "busy", "queued", "backend", "model"}` |
+| `GET /health` | 存活探測 | `{"status": "ok", "busy", "queued", "backend", "models": {"ja", "other"}}` |
 
 - 單一 worker 依提交順序一次處理一支影片。
 - 同一組 `url` + `lang` 還在排隊或執行中時重複提交，會回同一個 job。
-- 影片有人工上傳的字幕就直接回傳（`source: "subs"`），否則下載音檔轉錄（`source: "whisper"`）。
-- `result`：`{"transcript", "source", "title", "video_id", "model", "duration"}`。
+- 影片有該語言的人工上傳字幕就直接回傳（`source: "subs"`，`en` 也會收 `en-US` 等地區變體），否則下載音檔轉錄（`source: "whisper"`）。`auto` 不抓字幕。
+- `result`：`{"transcript", "source", "title", "video_id", "model", "language", "duration"}`；`auto` 時 `language` 是偵測到的語言。
 
 ```sh
 source .env

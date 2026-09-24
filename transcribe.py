@@ -14,9 +14,10 @@ YouTube 日文影片 -> 逐字稿
     其他 (含本機 WSL + RTX 3060) -> faster-whisper (anime-whisper CT2 int8)
     (mlx 後端要明確指定 --backend mlx)
 
-模型:
-    地端主力 = litagin/anime-whisper (kotoba-v2.0 微調於動漫/Galgame 語音),
-    對 VTuber 情緒與非語言音辨識最佳。faster 路徑用社群 CT2 int8 轉檔。
+模型 (依 --language 自動選):
+    ja      -> litagin/anime-whisper (kotoba-v2.0 微調於動漫/Galgame 語音),
+               對 VTuber 情緒與非語言音辨識最佳; 只懂日文。
+    其他/auto -> whisper-large-v3-turbo (多語)。
 """
 
 from __future__ import annotations
@@ -35,14 +36,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-# backend -> 預設模型
+# backend -> {語言: 預設模型}; "*" = 其他語言與 auto。
+# anime-whisper / kotoba 只懂日文, 其他語言一律走多語的 large-v3-turbo。
 MODELS = {
-    # anime-whisper 沒有官方 CT2 檔,用社群轉好的 int8 版 (MIT, 768MB)
-    "faster": "quantumcookie/anime-whisper-ct2-int8",
-    # M3 之後建議改用支援長片的 Qwen3-ASR JA MLX 版;kotoba-mlx 為暫時預設
-    "mlx": "kaiinui/kotoba-whisper-v2.0-mlx",
-    # whisper.cpp: <HF repo>/<檔名> 或本機 .bin 路徑。社群 ggml 轉檔 (MIT)
-    "cpp": "Aratako/anime-whisper-ggml/ggml-anime-whisper-q8_0.bin",
+    "faster": {
+        # anime-whisper 沒有官方 CT2 檔,用社群轉好的 int8 版 (MIT, 768MB)
+        "ja": "quantumcookie/anime-whisper-ct2-int8",
+        "*": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    },
+    "mlx": {
+        # M3 之後建議改用支援長片的 Qwen3-ASR JA MLX 版;kotoba-mlx 為暫時預設
+        "ja": "kaiinui/kotoba-whisper-v2.0-mlx",
+        "*": "mlx-community/whisper-large-v3-turbo",
+    },
+    "cpp": {
+        # whisper.cpp: <HF repo>/<檔名> 或本機 .bin 路徑。社群 ggml 轉檔 (MIT)
+        "ja": "Aratako/anime-whisper-ggml/ggml-anime-whisper-q8_0.bin",
+        "*": "ggerganov/whisper.cpp/ggml-large-v3-turbo-q8_0.bin",
+    },
 }
 
 # --model 可以給別名, 省得記整串 repo id
@@ -51,6 +62,8 @@ MODEL_ALIASES = {
     "kotoba": "kotoba-tech/kotoba-whisper-v2.0-faster",       # faster
     "kotoba-mlx": "kaiinui/kotoba-whisper-v2.0-mlx",      # mlx
     "anime-cpp": "Aratako/anime-whisper-ggml/ggml-anime-whisper-q8_0.bin",  # cpp
+    "large-v3-turbo-cpp": "ggerganov/whisper.cpp/ggml-large-v3-turbo-q8_0.bin",  # cpp, 多語
+    "large-v3-turbo-mlx": "mlx-community/whisper-large-v3-turbo",  # mlx, 多語
     "large-v3": "Systran/faster-whisper-large-v3",            # faster, 通用最穩
     "large-v3-turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",  # faster fallback
 }
@@ -228,11 +241,17 @@ def pick_backend(requested: str) -> str:
     return "faster"
 
 
-def resolve_model(requested: str | None, backend: str) -> str:
-    """--model 可以是別名、完整 repo id, 或 None (用 backend 預設)。"""
+def resolve_model(requested: str | None, backend: str, language: str = "ja") -> str:
+    """--model 可以是別名、完整 repo id, 或 None (依 backend + 語言用預設)。"""
     if not requested:
-        return MODELS[backend]
+        return MODELS[backend].get(language, MODELS[backend]["*"])
     return MODEL_ALIASES.get(requested, requested)
+
+
+def is_short_form(model_id: str) -> bool:
+    """anime-whisper / kotoba 是短句訓練的 distil 模型: 要 15 秒窗 + 防重複;
+    一般 whisper (turbo 等) 用標準 30 秒窗即可。"""
+    return any(k in model_id.lower() for k in ("anime", "kotoba"))
 
 
 def fmt_ts(seconds: float, sep: str = ",") -> str:
@@ -335,8 +354,9 @@ class WhisperCppBackend:
 
     不用 whisper.cpp 內建 VAD: 它把語音段接成連續音訊再以 30 秒窗前進,
     anime-whisper 不出時間戳, 每窗只吐前一兩句就跳下一窗, 實測漏掉約一半內容且會跳針。
-    改成先用 silero VAD 切成 <= chunk_length 秒的片段, 每段各自解碼 (同 faster-whisper 的 15 秒窗),
-    -ac 讓 encoder 只算 chunk_length 秒, 省一半 encode 時間。
+    改成先用 silero VAD 切成 <= chunk_length 秒的片段, 每段各自解碼 (同 faster-whisper 的 15 秒窗)。
+    短句模型再加 -ac 讓 encoder 只算 chunk_length 秒, 省一半 encode 時間;
+    一般 whisper 是 30 秒 context 訓練的, 不縮 -ac 以免掉精度。
     """
 
     SR = 16000
@@ -348,6 +368,7 @@ class WhisperCppBackend:
         self.model_path = self._resolve(model_id)
         self.beam_size = beam_size
         self.chunk_length = chunk_length
+        self.audio_ctx = chunk_length * 50 if is_short_form(model_id) and chunk_length < 30 else 0
         print(f"[model] whisper.cpp / {model_id}")
 
     @staticmethod
@@ -416,9 +437,12 @@ class WhisperCppBackend:
                 "-l", "auto" if language == "auto" else language,
                 "-bs", str(self.beam_size), "-bo", str(self.beam_size),
                 "-mc", "0",  # 不帶前文 (同 condition_on_previous_text=False)
-                "-ac", str(self.chunk_length * 50),  # encoder 只算 chunk_length 秒
-                "-nt", "-otxt", "-np",
+                "-nt", "-otxt",
             ]
+            if language != "auto":
+                cmd.append("-np")  # auto 時要留著 log 才讀得到偵測出的語言
+            if self.audio_ctx:
+                cmd += ["-ac", str(self.audio_ctx)]  # encoder 只算 chunk_length 秒
             for w in wavs:
                 cmd += ["-f", str(w)]
             proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
@@ -435,6 +459,12 @@ class WhisperCppBackend:
                 out.append({"start": start, "end": end, "text": text})
                 if verbose:
                     print(f"  {min(end / duration * 100, 100):5.1f}% [{fmt_ts(start, '.')}] {text}")
+
+        if language == "auto":
+            from collections import Counter
+
+            found = re.findall(r"auto-detected language: (\w+)", proc.stderr + proc.stdout)
+            language = Counter(found).most_common(1)[0][0] if found else "auto"
         return out, {"language": language, "duration": duration}
 
 
@@ -444,9 +474,15 @@ def make_backend(
     device: str = "auto",
     compute_type: str = "auto",
     beam_size: int = 5,
-    chunk_length: int = 15,
-    no_repeat_ngram_size: int = 5,
+    chunk_length: int | None = None,
+    no_repeat_ngram_size: int | None = None,
 ):
+    # None = 依模型決定: 短句模型 15 秒 + no_repeat 5 (litagin 建議), 一般 whisper 30 秒 + 不限制
+    short = is_short_form(model_id)
+    if chunk_length is None:
+        chunk_length = 15 if short else 30
+    if no_repeat_ngram_size is None:
+        no_repeat_ngram_size = 5 if short else 0
     if name == "mlx":
         return MlxBackend(model_id)
     if name == "cpp":
@@ -528,10 +564,15 @@ def main() -> int:
     ap.add_argument(
         "--no-repeat-ngram-size",
         type=int,
-        default=5,
-        help="防重複 (anime-whisper 建議 5, 設 0 關閉)",
+        default=None,
+        help="防重複; 預設 anime/kotoba 為 5 (litagin 建議), 其他模型 0 (關閉)",
     )
-    ap.add_argument("--chunk-length", type=int, default=15, help="kotoba/anime-whisper 建議 15 秒")
+    ap.add_argument(
+        "--chunk-length",
+        type=int,
+        default=None,
+        help="窗口秒數; 預設 anime/kotoba 為 15, 其他模型 30",
+    )
     ap.add_argument("--start", default=None, help="從第幾秒開始, 例 90 或 1:30")
     ap.add_argument("--duration", default=None, help="只處理多長, 例 600 或 10:00")
     ap.add_argument("--end", default=None, help="到第幾秒為止 (與 --duration 擇一)")
@@ -551,8 +592,9 @@ def main() -> int:
         for alias, repo in MODEL_ALIASES.items():
             print(f"  {alias:16s} -> {repo}")
         print("\n後端預設:")
-        for backend, repo in MODELS.items():
-            print(f"  {backend:16s} -> {repo}")
+        for backend, by_lang in MODELS.items():
+            for lang, repo in by_lang.items():
+                print(f"  {backend + ' / ' + lang:16s} -> {repo}")
         return 0
 
     if not args.inputs:
@@ -577,7 +619,9 @@ def main() -> int:
     ensure_ffmpeg()
 
     backend_name = pick_backend(args.backend)
-    model_id = resolve_model(args.model, backend_name)
+    model_id = resolve_model(args.model, backend_name, args.language)
+    if is_short_form(model_id) and args.language != "ja":
+        print(f"  ! 提醒: {model_id} 只懂日文, --language {args.language} 可能轉不出東西", file=sys.stderr)
 
     try:
         # 先把所有音檔準備好, 再載入模型 (模型只載一次)

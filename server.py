@@ -3,11 +3,14 @@
 M3 轉錄服務 (見 plan.md「M3 端:Whisper 轉錄服務」)
 
     POST /jobs        {"url": "...", "lang": "ja"} + Authorization: Bearer <token>
+                      lang: ISO 639-1 代碼 (ja/en/zh/...) 或 auto (自動偵測)
         -> 202 {"job_id": "...", "status": "queued", "position": 1}
     GET  /jobs/{id}   + Authorization: Bearer <token>
         -> {"status": "queued|running|done|error", "position": N,
             "result": {"transcript": "...", "source": "subs|whisper", ...}, "error": "..."}
-    GET  /health      -> 200 {"status": "ok", "busy": bool, "queued": int}
+    GET  /health      -> 200 {"status": "ok", "busy": bool, "queued": int, "models": {...}}
+
+模型依 lang 選: ja 用 anime-whisper (只懂日文), 其他語言與 auto 用多語的 large-v3-turbo。
 
 同一組 url+lang 還在排隊/執行中時重複提交, 回同一個 job (bot 重送不會多跑)。
 完成的 job 保留 JOB_TTL 秒供輪詢, 之後清掉 (查不到回 404)。
@@ -15,7 +18,8 @@ M3 轉錄服務 (見 plan.md「M3 端:Whisper 轉錄服務」)
 環境變數:
     TRANSCRIBE_TOKEN   必填, bearer token
     WHISPER_BACKEND    auto/cpp/mlx/faster (預設 auto, 同 transcribe.py; M3 上為 cpp)
-    WHISPER_MODEL      覆寫模型 (別名或 repo id)
+    WHISPER_MODEL      覆寫 ja 用的模型 (別名或 repo id)
+    WHISPER_MODEL_OTHER 覆寫其他語言 / auto 用的模型
     QUEUE_MAX          排隊上限 (不含執行中), 超過回 429 (預設 5)
     JOB_TTL            完成的 job 保留秒數 (預設 3600)
     HOST / PORT        預設 0.0.0.0 / 8000
@@ -37,13 +41,14 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import transcribe as tx
 
 TOKEN = os.environ.get("TRANSCRIBE_TOKEN", "")
 BACKEND = os.environ.get("WHISPER_BACKEND", "auto")
 MODEL = os.environ.get("WHISPER_MODEL") or None
+MODEL_OTHER = os.environ.get("WHISPER_MODEL_OTHER") or None
 QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "5"))
 JOB_TTL = int(os.environ.get("JOB_TTL", "3600"))
 
@@ -75,13 +80,14 @@ def vtt_to_text(vtt: str) -> str:
 
 
 def fetch_subs(url: str, lang: str, workdir: Path) -> tuple[str | None, dict]:
-    """只抓人工上傳的字幕 (不含自動字幕);有就回純文字。"""
+    """只抓人工上傳的字幕 (不含自動字幕);有就回純文字。lang=auto 時不抓字幕。"""
     import yt_dlp
 
     opts = {
         "skip_download": True,
-        "writesubtitles": True,
-        "subtitleslangs": [lang],
+        "writesubtitles": lang != "auto",
+        # en 也收 en-US / en-GB 這類地區變體
+        "subtitleslangs": [lang, f"{re.escape(lang)}-.*"],
         "subtitlesformat": "vtt",
         "outtmpl": str(workdir / "subs.%(ext)s"),
         "noplaylist": True,
@@ -119,13 +125,15 @@ def run_job(url: str, lang: str) -> dict:
         if not got:
             raise RuntimeError("音檔下載失敗")
         wav = to_wav16k(got[0].path, workdir / "audio.wav")
-        segs, meta = _state["backend"].transcribe(wav, lang, verbose=False)
+        backend, model_id = get_backend(lang)
+        segs, meta = backend.transcribe(wav, lang, verbose=False)
         text = "\n".join(s["text"] for s in segs if s["text"])
         return {
             **base,
             "transcript": text,
             "source": "whisper",
-            "model": _state["model_id"],
+            "model": model_id,
+            "language": meta.get("language"),
             "duration": meta.get("duration"),
         }
 
@@ -174,13 +182,32 @@ async def worker() -> None:
             _queue.task_done()
 
 
+def model_for(lang: str) -> str:
+    if lang == "ja":
+        return tx.resolve_model(MODEL, _state["backend_name"], "ja")
+    return tx.resolve_model(MODEL_OTHER, _state["backend_name"], lang)
+
+
+def get_backend(lang: str):
+    """每個模型一個 backend, 第一次用到才建 (只有 worker thread 會呼叫, 不必上鎖)。"""
+    model_id = model_for(lang)
+    backends = _state["backends"]
+    if model_id not in backends:
+        backends[model_id] = tx.make_backend(_state["backend_name"], model_id)
+    return backends[model_id], model_id
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tx.ensure_ffmpeg()
     backend_name = tx.pick_backend(BACKEND)
-    model_id = tx.resolve_model(MODEL, backend_name)
-    # 模型常駐: 啟動時載入一次 (cpp 每個 job 起一次 whisper-cli, 載入約 0.3 秒, 這裡只先下載好模型)
-    backend = tx.make_backend(backend_name, model_id)
+    _state.update(backend_name=backend_name, backends={})
+    # 模型常駐: 啟動時先載入 ja 模型。
+    # cpp 每個 job 起一次 whisper-cli (載入約 0.3 秒), 不佔常駐記憶體, 所以多語模型也先下載好;
+    # faster/mlx 的多語模型要佔記憶體, 等第一次用到再載。
+    backend, model_id = get_backend("ja")
+    if backend_name == "cpp":
+        get_backend("auto")
     if backend_name == "mlx":
         # mlx_whisper 是 lazy load, 先用 1 秒靜音暖機把權重拉進記憶體
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,9 +218,8 @@ async def lifespan(app: FastAPI):
                 check=True,
             )
             backend.transcribe(silence, "ja", verbose=False)
-    _state.update(backend=backend, backend_name=backend_name, model_id=model_id)
     task = asyncio.create_task(worker())
-    print(f"[ready] {backend_name} / {model_id}", flush=True)
+    print(f"[ready] {backend_name} / ja={model_for('ja')} / other={model_for('auto')}", flush=True)
     yield
     task.cancel()
 
@@ -209,7 +235,7 @@ def check_token(authorization: str = Header(default="")) -> None:
 
 class TranscribeReq(BaseModel):
     url: str
-    lang: str = "ja"
+    lang: str = Field(default="ja", pattern=r"^([a-z]{2,3}|auto)$")
 
 
 @app.get("/health")
@@ -219,7 +245,7 @@ async def health():
         "busy": any(j["status"] == "running" for j in _jobs.values()),
         "queued": len(_queued_jobs()),
         "backend": _state.get("backend_name"),
-        "model": _state.get("model_id"),
+        "models": {"ja": model_for("ja"), "other": model_for("auto")} if _state else None,
     }
 
 
